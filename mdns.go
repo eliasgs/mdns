@@ -36,6 +36,7 @@ func New() (*Zone, error) {
 	z := &Zone{
 		entries: make(map[string]entries),
 		add:     make(chan *entry),
+		remove:  make(chan *entry),
 		queries: make(chan *query, 16),
 	}
 	go z.mainloop()
@@ -82,6 +83,7 @@ type Zone struct {
 	entries map[string]entries
 	add     chan *entry // add entries to zone
 	queries chan *query // query exsting entries in zone
+	remove  chan *entry // remove entries from zone
 }
 
 // Publish adds a record, described in RFC XXX
@@ -94,12 +96,36 @@ func (z *Zone) Publish(r string) error {
 	return nil
 }
 
+// Unpublish removes a record, described in RFC XXX
+func (z *Zone) Unpublish(r string) error {
+	rr, err := dns.NewRR(r)
+	if err != nil {
+		return err
+	}
+	z.remove <- &entry{rr}
+	return nil
+}
+
 func (z *Zone) mainloop() {
 	for {
 		select {
 		case entry := <-z.add:
 			if !z.entries[entry.fqdn()].contains(entry) {
 				z.entries[entry.fqdn()] = append(z.entries[entry.fqdn()], entry)
+			}
+		case entry := <-z.remove:
+			if _, ok := z.entries[entry.fqdn()]; ok {
+				tmp := z.entries[entry.fqdn()][:0]
+				for _, e := range z.entries[entry.fqdn()] {
+					if !equals(entry, e) {
+						tmp = append(tmp, e)
+					}
+				}
+
+				z.entries[entry.fqdn()] = tmp
+				if len(z.entries[entry.fqdn()]) == 0 {
+					delete(z.entries, entry.fqdn())
+				}
 			}
 		case q := <-z.queries:
 			for _, entry := range z.entries[q.Question.Name] {
@@ -126,13 +152,7 @@ func (q *query) matches(entry *entry) bool {
 }
 
 func equals(this, that *entry) bool {
-	if _, ok := this.RR.(*dns.ANY); ok {
-		return true // *ANY matches anything
-	}
-	if _, ok := that.RR.(*dns.ANY); ok {
-		return true // *ANY matches all
-	}
-	return false
+	return dns.IsDuplicate(this.RR, that.RR)
 }
 
 type connector struct {
